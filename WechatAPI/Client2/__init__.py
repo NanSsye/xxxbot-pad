@@ -10,11 +10,64 @@ from .tool import ToolMixin
 from .tool_extension import ToolExtensionMixin
 from .user import UserMixin
 from .pyq import PyqMixin
+import sqlite3
+import os
+from loguru import logger
 
 class WechatAPIClient(LoginMixin, MessageMixin, FriendMixin, ChatroomMixin, UserMixin,
                       ToolMixin, ToolExtensionMixin, HongBaoMixin, PyqMixin):
 
     # 这里都是需要结合多个功能的方法
+    
+    def __init__(self, ip: str, port: int):
+        super().__init__(ip, port)
+        self.contacts_db = None
+    
+    def get_contacts_db(self):
+        """连接到contacts.db数据库"""
+        if self.contacts_db is None:
+            try:
+                # 适配不同环境的路径
+                if os.path.exists("/app/database"):
+                    db_path = "/app/database/contacts.db"
+                else:
+                    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                    db_path = os.path.join(base_dir, "database", "contacts.db")
+                
+                self.contacts_db = sqlite3.connect(db_path)
+                logger.info(f"联系人数据库初始化成功: {db_path}")
+            except Exception as e:
+                logger.error(f"初始化联系人数据库失败: {str(e)}")
+                self.contacts_db = None
+        return self.contacts_db
+    
+    def get_local_nickname(self, wxid: str, chatroom_id: str = None):
+        """从本地contacts.db获取用户昵称"""
+        if not wxid:
+            return None
+        
+        # 从contacts.db的group_members表获取成员信息
+        if chatroom_id and "@chatroom" in chatroom_id:
+            try:
+                conn = self.get_contacts_db()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                    SELECT member_wxid, nickname, display_name FROM group_members 
+                    WHERE group_wxid = ? AND member_wxid = ?
+                    """, (chatroom_id, wxid))
+                    
+                    result = cursor.fetchone()
+                    if result:
+                        # 优先使用display_name，如果为空再使用nickname
+                        if result[2]:  # display_name
+                            return result[2]
+                        elif result[1]:  # nickname
+                            return result[1]
+            except Exception as e:
+                logger.error(f"从contacts.db获取昵称失败: {str(e)}")
+        
+        return None
 
     async def send_at_message(self, wxid: str, content: str, at: list[str]) -> tuple[int, int, int]:
         """发送@消息
@@ -41,9 +94,26 @@ class WechatAPIClient(LoginMixin, MessageMixin, FriendMixin, ChatroomMixin, User
 
         output = ""
         for id in at:
-            nickname = await self.get_nickname(id)
+            # 优先从contacts.db获取昵称
+            local_nickname = self.get_local_nickname(id, wxid)
+            if local_nickname:
+                nickname = local_nickname
+                logger.debug(f"使用本地数据库昵称 @{local_nickname}")
+            else:
+                # 如果本地数据库没有，再通过API获取
+                nickname = await self.get_nickname(id)
+                logger.debug(f"使用API昵称 @{nickname}")
+            
             output += f"@{nickname}\u2005"
 
         output += content
 
         return await self.send_text_message(wxid, output, at)
+        
+    def __del__(self):
+        """清理资源"""
+        if hasattr(self, 'contacts_db') and self.contacts_db:
+            try:
+                self.contacts_db.close()
+            except:
+                pass
